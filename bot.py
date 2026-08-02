@@ -120,13 +120,19 @@ def get_current_price(ticker):
 # ---------------------------------------------------------------------------
 async def handle_signal_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if msg is None or msg.text is None:
+    if msg is None:
+        return
+
+    # Signal xabarlari ko'pincha rasm (chart) + caption ko'rinishida keladi —
+    # bunday holda matn message.text'da EMAS, message.caption'da bo'ladi.
+    text = msg.text or msg.caption
+    if text is None:
         return
 
     if update.effective_chat is None or update.effective_chat.id != SIGNAL_CHANNEL_ID:
         return  # boshqa chat/kanallardan kelgan narsalarni e'tiborsiz qoldiramiz
 
-    match = TICKER_RE.search(msg.text)
+    match = TICKER_RE.search(text)
     if not match:
         return
 
