@@ -4,6 +4,10 @@ import sqlite3
 import logging
 from datetime import datetime, timezone
 
+import csv
+import io as _io
+
+import requests
 import yfinance as yf
 from telegram import Bot, Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -36,6 +40,18 @@ DB_PATH = os.getenv("DB_PATH", "positions.db")
 TICKER_RE = re.compile(r"Ticker:\s*([A-Za-z.]{1,10})", re.IGNORECASE)
 
 results_bot = Bot(token=RESULTS_BOT_TOKEN) if RESULTS_BOT_TOKEN else None
+
+# Yahoo Finance ko'pincha Railway/AWS/GCP kabi datacenter IP manzillaridan
+# kelgan so'rovlarni bloklab, JSON o'rniga bo'sh javob qaytaradi. Buni
+# aylanib o'tish uchun curl_cffi orqali haqiqiy brauzer (Chrome) so'rovini
+# taqlid qilamiz — bu yfinance rasmiy tavsiyasi.
+try:
+    from curl_cffi import requests as cffi_requests
+
+    _yf_session = cffi_requests.Session(impersonate="chrome")
+except Exception as e:
+    log.warning(f"[Price] curl_cffi mavjud emas, oddiy session ishlatiladi: {e}")
+    _yf_session = None
 
 
 # ---------------------------------------------------------------------------
@@ -93,25 +109,64 @@ def close_position(conn, pos_id, close_price, result, pct):
 
 
 # ---------------------------------------------------------------------------
-# Narx olish (yfinance)
+# Narx olish (yfinance, keyin Stooq zaxira sifatida)
 # ---------------------------------------------------------------------------
-def get_current_price(ticker):
+def _get_price_yfinance(ticker):
+    kwargs = {"session": _yf_session} if _yf_session else {}
+
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, **kwargs)
         fi = getattr(t, "fast_info", None)
         price = fi.get("lastPrice") if fi else None
         if price:
             return float(price)
     except Exception as e:
-        log.warning(f"[Price] fast_info xato ({ticker}): {e}")
+        log.warning(f"[Price] yfinance fast_info xato ({ticker}): {e}")
 
     try:
-        hist = yf.Ticker(ticker).history(period="1d")
+        hist = yf.Ticker(ticker, **kwargs).history(period="1d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
     except Exception as e:
-        log.warning(f"[Price] history xato ({ticker}): {e}")
+        log.warning(f"[Price] yfinance history xato ({ticker}): {e}")
 
+    return None
+
+
+def _get_price_stooq(ticker):
+    """
+    Zaxira narx manbai — Stooq.com'ning bepul CSV endpointi. Yahoo
+    bloklangan hollarda ishlatiladi. Faqat AQSH tickerlari uchun ".US"
+    qo'shimchasi kerak.
+    """
+    url = f"https://stooq.com/q/l/?s={ticker.lower()}.us&f=sd2t2ohlcv&h&e=csv"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        reader = csv.DictReader(_io.StringIO(resp.text))
+        row = next(reader, None)
+        if not row:
+            return None
+        close = row.get("Close")
+        if close in (None, "", "N/D"):
+            return None
+        return float(close)
+    except Exception as e:
+        log.warning(f"[Price] Stooq xato ({ticker}): {e}")
+        return None
+
+
+def get_current_price(ticker):
+    price = _get_price_yfinance(ticker)
+    if price is not None:
+        return price
+
+    log.info(f"[Price] {ticker}: yfinance muvaffaqiyatsiz, Stooq'ga o'tamiz")
+    price = _get_price_stooq(ticker)
+    if price is not None:
+        return price
+
+    log.warning(f"[Price] {ticker}: hech qaysi manbadan narx olinmadi")
     return None
 
 
