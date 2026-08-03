@@ -75,6 +75,28 @@ def db_connect():
         )
     """)
     conn.commit()
+
+    # Migratsiya: Volume'da eski sxema bilan yaratilgan positions.db bo'lishi
+    # mumkin (algorithm/peak_price/trail_active ustunlarisiz). Yetishmayotgan
+    # ustunlarni xavfsiz qo'shib qo'yamiz.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+    migrations = {
+        "algorithm": "ALTER TABLE positions ADD COLUMN algorithm TEXT",
+        "peak_price": "ALTER TABLE positions ADD COLUMN peak_price REAL NOT NULL DEFAULT 0",
+        "trail_active": "ALTER TABLE positions ADD COLUMN trail_active INTEGER NOT NULL DEFAULT 0",
+    }
+    for col, sql in migrations.items():
+        if col not in existing_cols:
+            log.info(f"[DB] Migratsiya: '{col}' ustuni qo'shilmoqda")
+            conn.execute(sql)
+    conn.commit()
+
+    # peak_price hali 0 bo'lgan eski qatorlarni entry_price bilan to'ldiramiz
+    conn.execute(
+        "UPDATE positions SET peak_price = entry_price WHERE peak_price = 0 OR peak_price IS NULL"
+    )
+    conn.commit()
+
     return conn
 
 
