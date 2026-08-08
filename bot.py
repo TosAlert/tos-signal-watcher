@@ -31,12 +31,21 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
 REPORT_HOUR_UTC = int(os.getenv("REPORT_HOUR_UTC", "4"))
 TASHKENT_OFFSET_HOURS = 5
 
+# --- Sifatli kirish filtri ---
+# Signal shu mezonlarga mos kelmasa, kuzatuvga qo'shilmaydi.
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", "1.5"))   # (Resistance-entry)/(entry-Support)
+MAX_ENTRY_RSI = float(os.getenv("MAX_ENTRY_RSI", "70"))   # RSI shundan yuqori bo'lsa - overbought
+MIN_ENTRY_RVOL = float(os.getenv("MIN_ENTRY_RVOL", "1.2"))  # past hajmli soxta breakout'larni filtrlaydi
+
 # MUHIM: Railway'da bu yo'l albatta Volume'ga ko'rsatilishi kerak
 # (masalan /data/positions.db), aks holda har deployda ma'lumotlar o'chadi.
 DB_PATH = os.getenv("DB_PATH", "positions.db")
 
 TICKER_RE = re.compile(r"Ticker:\s*([A-Za-z.]{1,10})", re.IGNORECASE)
 ALGO_RE = re.compile(r"Algorithm:\s*([^\n\r]+)", re.IGNORECASE)
+SUPPORT_RE = re.compile(r"Support:\s*\$?([\d.]+)", re.IGNORECASE)
+RESISTANCE_RE = re.compile(r"Resistance:\s*\$?([\d.]+)", re.IGNORECASE)
+RVOL_RE = re.compile(r"RVol:\s*([\d.]+)", re.IGNORECASE)
 
 results_bot = Bot(token=RESULTS_BOT_TOKEN) if RESULTS_BOT_TOKEN else None
 
@@ -237,6 +246,77 @@ def get_current_price(ticker):
     return None
 
 
+def _get_rsi(ticker, period=14):
+    """
+    Oxirgi ~2 oylik kunlik yopilish narxlaridan oddiy (SMA-asosli) RSI(14)
+    hisoblaydi. Signal xabarida RSI berilmagani uchun buni o'zimiz
+    hisoblashimiz kerak.
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"interval": "1d", "range": "2mo"}
+    try:
+        if _yf_session:
+            resp = _yf_session.get(url, params=params, timeout=10)
+        else:
+            resp = requests.get(url, params=params, timeout=10, headers=_YAHOO_HEADERS)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        result = (data.get("chart") or {}).get("result")
+        if not result:
+            return None
+
+        closes = result[0]["indicators"]["quote"][0]["close"]
+        closes = [c for c in closes if c is not None]
+        if len(closes) < period + 1:
+            return None
+
+        deltas = [closes[i + 1] - closes[i] for i in range(len(closes) - 1)][-period:]
+        gains = [d for d in deltas if d > 0]
+        losses = [-d for d in deltas if d < 0]
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+    except Exception as e:
+        log.warning(f"[RSI] xato ({ticker}): {e}")
+        return None
+
+
+def _check_entry_quality(ticker, entry_price, support, resistance, rvol):
+    """
+    Sifatli kirish filtri. Rad etilsa (ok=False, sabab) qaytaradi.
+    Ma'lumot yetishmasa (masalan support/resistance yo'q), o'sha aniq
+    tekshiruv o'tkazib yuboriladi — faqat mavjud ma'lumotlar bo'yicha
+    baholaymiz.
+    """
+    reasons = []
+
+    if support is not None and resistance is not None:
+        risk = entry_price - support
+        reward = resistance - entry_price
+        if risk <= 0:
+            return False, f"narx Support'dan pastda (support=${support:.2f})"
+        rr = reward / risk
+        if rr < MIN_RR_RATIO:
+            reasons.append(f"R:R past ({rr:.2f} < {MIN_RR_RATIO})")
+
+    if rvol is not None and rvol < MIN_ENTRY_RVOL:
+        reasons.append(f"RVol past ({rvol:.2f} < {MIN_ENTRY_RVOL})")
+
+    rsi = _get_rsi(ticker)
+    if rsi is not None and rsi >= MAX_ENTRY_RSI:
+        reasons.append(f"RSI overbought ({rsi:.1f} >= {MAX_ENTRY_RSI})")
+
+    if reasons:
+        return False, "; ".join(reasons)
+    return True, None
+
+
 # ---------------------------------------------------------------------------
 # 1) Signal kanalini FAQAT o'qiydi — hech qachon bu yerga yozmaydi
 # ---------------------------------------------------------------------------
@@ -261,6 +341,13 @@ async def handle_signal_message(update: Update, context: ContextTypes.DEFAULT_TY
     algo_match = ALGO_RE.search(text)
     algorithm = algo_match.group(1).strip() if algo_match else "Noma'lum"
 
+    support_match = SUPPORT_RE.search(text)
+    resistance_match = RESISTANCE_RE.search(text)
+    rvol_match = RVOL_RE.search(text)
+    support = float(support_match.group(1)) if support_match else None
+    resistance = float(resistance_match.group(1)) if resistance_match else None
+    rvol = float(rvol_match.group(1)) if rvol_match else None
+
     conn = db_connect()
     try:
         if has_open_position(conn, ticker):
@@ -270,6 +357,11 @@ async def handle_signal_message(update: Update, context: ContextTypes.DEFAULT_TY
         entry_price = get_current_price(ticker)
         if entry_price is None:
             log.warning(f"[Signal] {ticker} narxi olinmadi, kuzatuvga qo'shilmadi")
+            return
+
+        ok, reason = _check_entry_quality(ticker, entry_price, support, resistance, rvol)
+        if not ok:
+            log.info(f"[Filter] {ticker} rad etildi: {reason}")
             return
 
         add_position(conn, ticker, algorithm, entry_price)
@@ -509,6 +601,9 @@ def main():
     log.info(
         f"TP: +{TAKE_PROFIT_PCT}% (trailing {TRAIL_PCT}%) | SL: -{STOP_LOSS_PCT}% | "
         f"Tekshiruv: har {CHECK_INTERVAL_MINUTES} daqiqada"
+    )
+    log.info(
+        f"Kirish filtri: R:R >= {MIN_RR_RATIO} | RSI < {MAX_ENTRY_RSI} | RVol >= {MIN_ENTRY_RVOL}"
     )
     log.info(f"Hisobotlar: har kuni soat {REPORT_HOUR_UTC:02d}:00 UTC (Toshkent 09:00)")
 
