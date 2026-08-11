@@ -170,16 +170,30 @@ _YAHOO_HEADERS = {
 
 def _get_price_yahoo(ticker):
     """
-    yfinance kutubxonasi o'rniga Yahoo'ning ochiq chart API'siga to'g'ridan-to'g'ri
-    murojaat qilamiz — bu yfinance + curl_cffi orasidagi nomuvofiqlikdan qochadi.
+    Yahoo Finance Chart API orqali joriy narxni oladi.
+
+    Pre-market va after-hours ham hisobga olinadi.
+    Signal kelgan vaqtdagi real-time/extended-hours narxni
+    oldingi kunning regular close narxidan ustun qo'yadi.
     """
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {"interval": "1d", "range": "5d"}
+
+    params = {
+        "interval": "1m",
+        "range": "1d",
+        "includePrePost": "true",
+    }
+
     try:
         if _yf_session:
             resp = _yf_session.get(url, params=params, timeout=10)
         else:
-            resp = requests.get(url, params=params, timeout=10, headers=_YAHOO_HEADERS)
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=10,
+                headers=_YAHOO_HEADERS,
+            )
 
         if resp.status_code != 200:
             log.warning(f"[Price] Yahoo HTTP {resp.status_code} ({ticker})")
@@ -187,18 +201,148 @@ def _get_price_yahoo(ticker):
 
         data = resp.json()
         result = (data.get("chart") or {}).get("result")
+
         if not result:
+            log.warning(f"[Price] Yahoo result yo'q ({ticker})")
             return None
 
-        meta = result[0].get("meta", {}) or {}
-        price = meta.get("regularMarketPrice")
-        if price:
-            return float(price)
+        result = result[0]
+        meta = result.get("meta", {}) or {}
+        now_ts = int(datetime.now(timezone.utc).timestamp())
 
-        closes = result[0]["indicators"]["quote"][0]["close"]
-        closes = [c for c in closes if c is not None]
-        if closes:
-            return float(closes[-1])
+        periods = meta.get("currentTradingPeriod", {}) or {}
+        pre = periods.get("pre", {}) or {}
+        regular = periods.get("regular", {}) or {}
+        post = periods.get("post", {}) or {}
+
+        def in_period(period):
+            try:
+                start_ts = int(period.get("start"))
+                end_ts = int(period.get("end"))
+                return start_ts <= now_ts <= end_ts
+            except (TypeError, ValueError):
+                return False
+
+        # Premarket: aynan preMarketPrice'ni afzal ko'ramiz.
+        if in_period(pre):
+            pre_price = meta.get("preMarketPrice")
+            if pre_price is not None:
+                price = float(pre_price)
+                log.info(
+                    f"[Price] {ticker}: ${price:.2f} "
+                    f"(Yahoo PRE-MARKET)"
+                )
+                return price
+
+        # Regular session: oxirgi mavjud 1-minute candle.
+        if in_period(regular):
+            timestamps = result.get("timestamp") or []
+            quote_data = (
+                result.get("indicators", {})
+                .get("quote", [{}])[0]
+            )
+            closes = quote_data.get("close") or []
+
+            latest_price = None
+            latest_ts = None
+
+            for ts, close in zip(timestamps, closes):
+                if close is None:
+                    continue
+                try:
+                    ts_int = int(ts)
+                except (TypeError, ValueError):
+                    continue
+
+                if ts_int <= now_ts:
+                    latest_ts = ts_int
+                    latest_price = float(close)
+
+            if latest_price is not None:
+                log.info(
+                    f"[Price] {ticker}: ${latest_price:.2f} "
+                    f"(Yahoo 1m REGULAR, ts={latest_ts})"
+                )
+                return latest_price
+
+            regular_price = meta.get("regularMarketPrice")
+            if regular_price is not None:
+                price = float(regular_price)
+                log.info(
+                    f"[Price] {ticker}: ${price:.2f} "
+                    f"(Yahoo regularMarketPrice)"
+                )
+                return price
+
+        # After-hours: postMarketPrice.
+        if in_period(post):
+            post_price = meta.get("postMarketPrice")
+            if post_price is not None:
+                price = float(post_price)
+                log.info(
+                    f"[Price] {ticker}: ${price:.2f} "
+                    f"(Yahoo AFTER-HOURS)"
+                )
+                return price
+
+        # Sessiya aniqlanmasa, oxirgi mavjud 1-minute candle.
+        timestamps = result.get("timestamp") or []
+        quote_data = (
+            result.get("indicators", {})
+            .get("quote", [{}])[0]
+        )
+        closes = quote_data.get("close") or []
+
+        latest_price = None
+        latest_ts = None
+
+        for ts, close in zip(timestamps, closes):
+            if close is None:
+                continue
+            try:
+                ts_int = int(ts)
+            except (TypeError, ValueError):
+                continue
+
+            if ts_int <= now_ts:
+                latest_ts = ts_int
+                latest_price = float(close)
+
+        if latest_price is not None:
+            log.info(
+                f"[Price] {ticker}: ${latest_price:.2f} "
+                f"(Yahoo 1m fallback, ts={latest_ts})"
+            )
+            return latest_price
+
+        # Eng oxirgi fallbacklar.
+        pre_price = meta.get("preMarketPrice")
+        if pre_price is not None:
+            price = float(pre_price)
+            log.info(
+                f"[Price] {ticker}: ${price:.2f} "
+                f"(Yahoo preMarketPrice fallback)"
+            )
+            return price
+
+        post_price = meta.get("postMarketPrice")
+        if post_price is not None:
+            price = float(post_price)
+            log.info(
+                f"[Price] {ticker}: ${price:.2f} "
+                f"(Yahoo postMarketPrice fallback)"
+            )
+            return price
+
+        regular_price = meta.get("regularMarketPrice")
+        if regular_price is not None:
+            price = float(regular_price)
+            log.info(
+                f"[Price] {ticker}: ${price:.2f} "
+                f"(Yahoo regularMarketPrice fallback)"
+            )
+            return price
+
     except Exception as e:
         log.warning(f"[Price] Yahoo xato ({ticker}): {e}")
 
@@ -233,16 +377,23 @@ def _get_price_stooq(ticker):
 
 
 def get_current_price(ticker):
+    """
+    Entry va pozitsiya monitoringi uchun faqat Yahoo real-time/
+    extended-hours narxidan foydalanamiz.
+
+    Stooq daily Close narxini fallback sifatida ishlatmaymiz,
+    aks holda premarket signal yana oldingi kun close narxida
+    kuzatuvga olinishi mumkin.
+    """
     price = _get_price_yahoo(ticker)
+
     if price is not None:
         return price
 
-    log.info(f"[Price] {ticker}: Yahoo muvaffaqiyatsiz, Stooq'ga o'tamiz")
-    price = _get_price_stooq(ticker)
-    if price is not None:
-        return price
-
-    log.warning(f"[Price] {ticker}: hech qaysi manbadan narx olinmadi")
+    log.warning(
+        f"[Price] {ticker}: Yahoo'dan real-time narx olinmadi; "
+        f"pozitsiya tekshirilmaydi/kuzatuvga olinmaydi"
+    )
     return None
 
 
