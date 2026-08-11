@@ -364,8 +364,30 @@ async def handle_signal_message(update: Update, context: ContextTypes.DEFAULT_TY
             log.info(f"[Filter] {ticker} rad etildi: {reason}")
             return
 
+                # Pozitsiyani bazaga qo'shamiz
         add_position(conn, ticker, algorithm, entry_price)
-        log.info(f"[Signal] Yangi kuzatuv qo'shildi: {ticker} ({algorithm}) @ {entry_price:.2f}")
+
+        # Stop-Loss narxini hisoblaymiz
+        stop_price = entry_price * (1 - STOP_LOSS_PCT / 100)
+
+        # Yangi kuzatuv haqida Telegram kanaliga xabar
+        entry_text = (
+            f"🟢 YANGI POZITSIYA KUZATUVDA\n\n"
+            f"📌 Ticker: {ticker}\n"
+            f"🧠 Signal: {algorithm}\n"
+            f"🎯 Kirish narxi: ${entry_price:.2f}\n"
+            f"🛑 Stop-Loss: ${stop_price:.2f} (-{STOP_LOSS_PCT:.1f}%)\n"
+            f"🎯 Take-Profit trigger: +{TAKE_PROFIT_PCT:.1f}%\n"
+            f"📈 Trailing: {TRAIL_PCT:.1f}%\n\n"
+            f"⏱ Kuzatuv boshlandi"
+        )
+
+        await send_text(entry_text)
+
+        log.info(
+            f"[Signal] Yangi kuzatuv qo'shildi: "
+            f"{ticker} ({algorithm}) @ {entry_price:.2f}"
+        )
     finally:
         conn.close()
 
